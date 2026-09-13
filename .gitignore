@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.hermes/
+*.log
+
+# 本机同步说明（含私有源仓路径，不进 GitHub）
+SYNC.md
+AGENTS.md
