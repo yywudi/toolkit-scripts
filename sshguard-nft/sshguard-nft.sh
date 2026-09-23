@@ -111,8 +111,10 @@ ensure_whitelist_base() {
 10.0.0.0/8
 172.16.0.0/12
 192.168.0.0/16
+fe80::/10
+fc00::/7
 EOF
-    echo "[INFO] 已预置白名单（本机/内网段）: $SSHGUARD_WHITELIST"
+    echo "[INFO] 已预置白名单（本机/内网/IPv6 链路本地与唯一本地）: $SSHGUARD_WHITELIST"
     if [ -n "${SSH_CONNECTION:-}" ]; then
         local src_ip answer=""
         src_ip=$(echo "$SSH_CONNECTION" | awk '{print $1}')
@@ -176,25 +178,30 @@ confirm_apply_safe() {
 }
 
 write_sshguard_nft_conf() {
-    local ports_csv="$1"
-    cat > "$NFT_SSHGUARD_CONF" <<EOF
-#!/usr/sbin/nft -f
-
-table inet sshguard {
-    set sshguard-blacklist {
-        type ipv4_addr
-        flags timeout
-        # 必须 >= sshguard BLOCK_TIME(10d)，否则集合默认 TTL 会提前解除封禁
-        timeout 11d
-    }
-
-    chain input {
-        type filter hook input priority filter; policy accept;
-        ip saddr @sshguard-blacklist drop
-    }
-}
+    # Anchor file only. The real firewall tables are managed dynamically by the
+    # native backend `/usr/libexec/sshguard/sshg-fw-nft-sets` referenced from
+    # sshguard.conf: on start it creates `table ip sshguard` and
+    # `table ip6 sshguard`, each with chain `blacklist { priority -10 }` and
+    # set `attackers`; on stop (fw_fin) it deletes both tables again.
+    # A statically generated `table inet sshguard` would never receive elements
+    # and only misleads operators, so nothing but documentation lives here.
+    cat > "$NFT_SSHGUARD_CONF" <<'EOF'
+# Managed by sshguard-nft.sh (anchor only, no rules here).
+#
+# The firewall is handled by BACKEND=/usr/libexec/sshguard/sshg-fw-nft-sets:
+#   - on start : table ip/ip6 sshguard + chain blacklist (priority -10)
+#                + set attackers (ipv4_addr/ipv6_addr, flags interval)
+#   - on stop  : both tables are deleted and rebuilt on next start
+#
+# Inspect banned addresses:
+#   nft list set ip  sshguard attackers
+#   nft list set ip6 sshguard attackers
+#
+# Unblock an address:
+#   nft delete element ip  sshguard attackers { <IP> }
+#   nft delete element ip6 sshguard attackers { <IP> }
 EOF
-    echo "[INFO] Wrote $NFT_SSHGUARD_CONF"
+    echo "[INFO] Wrote $NFT_SSHGUARD_CONF (anchor only; tables are managed by the sshguard backend)"
 }
 
 write_sshguard_conf() {
@@ -235,7 +242,9 @@ print_rollback_hint() {
     echo "  $SSHGUARD_CONF.${TS}-pre-sshguard-conf-backup"
     echo "  live ruleset snapshot: $NFT_RULESET_BACKUP"
     echo "    restore with: nft -f $NFT_RULESET_BACKUP"
-    echo "Unblock an IP: nft delete element inet sshguard sshguard-blacklist { <IP> }"
+    echo "Unblock an IP:"
+    echo "  nft delete element ip  sshguard attackers { <IP> }"
+    echo "  nft delete element ip6 sshguard attackers { <IP> }"
     echo "Then run: systemctl restart sshguard"
 }
 
@@ -266,22 +275,37 @@ main() {
     confirm_apply_safe
     backup_live_ruleset
 
-    # 只加载 sshguard 自己的表（原子增量），绝不整包加载 main conf——
-    # 后者首行的 flush ruleset 会当场清空 ufw/docker/iptables-nft 运行时规则。
-    echo "应用 nftables 配置..."
-    nft -f "$NFT_SSHGUARD_CONF"
+    # 自本版本起不再静态生成任何 nft 表：真正生效的 `table ip/ip6 sshguard`
+    # （集合 attackers）由 sshguard 原生 backend 在服务启动时动态创建/删除。
+    # 因此这里绝不执行 `nft -f`（整包加载 main conf 会触发首行 flush ruleset，
+    # 当场清空 ufw/docker/iptables-nft 运行时规则）。
+    # 只清理历史版本遗留的空表 `inet sshguard`——其集合 sshguard-blacklist
+    # 从未被原生 backend 写入过任何元素，留着只会误导排查。
+    echo "清理历史遗留配置..."
+    if nft list table inet sshguard >/dev/null 2>&1; then
+        if nft delete table inet sshguard; then
+            echo "[INFO] 已清理历史遗留的空表: table inet sshguard"
+        else
+            echo "[WARN] table inet sshguard 删除失败，请手工执行: nft delete table inet sshguard"
+        fi
+    else
+        echo "[INFO] 无历史遗留表（inet sshguard），跳过清理"
+    fi
 
     echo "启动服务..."
-    # nftables 仅 enable（开机持久化），部署时不 restart——sshguard 表已由上一步
-    # 直接载入内核；此时 restart 反而会执行 flush ruleset 清掉现有运行时规则。
+    # nftables 仅 enable（开机持久化）；sshguard 表由原生 backend 在
+    # sshguard 启动时动态创建。此时不 restart nftables——那会执行
+    # flush ruleset 清掉现有运行时规则。
     systemctl enable nftables
     systemctl enable sshguard
     systemctl restart sshguard
 
     echo "完成"
-    echo "[INFO] sshguard nft config: $NFT_SSHGUARD_CONF"
+    echo "[INFO] sshguard nft anchor: $NFT_SSHGUARD_CONF"
     echo "[INFO] sshguard app config: $SSHGUARD_CONF"
-    echo "[INFO] blacklist set check: nft list set inet sshguard sshguard-blacklist"
+    echo "[INFO] banned set check:"
+    echo "         nft list set ip  sshguard attackers"
+    echo "         nft list set ip6 sshguard attackers"
     print_rollback_hint
     systemctl --no-pager --full status sshguard || true
 }

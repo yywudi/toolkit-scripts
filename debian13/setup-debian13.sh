@@ -7,6 +7,9 @@
 set -eu
 set -o pipefail
 
+# Safety swapfile location used by configure_swap_safety (site convention).
+SWAPFILE_PATH="/var/swap"
+
 function check_install {
 	if [ -z "$(command -v "$1" 2>/dev/null)" ]
 	then
@@ -96,6 +99,195 @@ function backup_file {
 	fi
 }
 
+function detect_virt_type {
+	if command -v systemd-detect-virt >/dev/null 2>&1
+	then
+		systemd-detect-virt 2>/dev/null || echo "baremetal"
+	else
+		echo "baremetal"
+	fi
+}
+
+# --- configuration transaction -------------------------------------------------
+# install_nginx touches several files before it can run `nginx -t`. `set -e`
+# aborts on the first failing command, so without a transaction a failure after
+# the default site was written would leave an unverified (possibly unloadable)
+# nginx configuration on disk. tx_begin arms an EXIT trap, tx_add snapshots a
+# file just before it is modified, and tx_commit disarms the trap once the
+# configuration has been validated.
+TX_PATHS=()
+TX_SNAPS=()
+TX_ACTIVE=0
+
+function tx_begin {
+	TX_PATHS=()
+	TX_SNAPS=()
+	TX_ACTIVE=1
+	trap 'tx_rollback' EXIT
+}
+
+function tx_add { # tx_add <path>  — snapshot a file before modifying it
+	local path="$1"
+	local i snap=""
+
+	# Registering the same file twice must keep the FIRST snapshot: it is the
+	# only one taken before the file was modified.
+	if [ "${#TX_PATHS[@]}" -gt 0 ]
+	then
+		for i in "${!TX_PATHS[@]}"
+		do
+			if [ "${TX_PATHS[$i]}" = "$path" ]
+			then
+				return 0
+			fi
+		done
+	fi
+
+	if [ -e "$path" ]
+	then
+		snap=$(mktemp /tmp/setup-debian13-tx.XXXXXX)
+		if ! cp -a "$path" "$snap"
+		then
+			rm -f "$snap"
+			die "tx_add: could not snapshot $path"
+		fi
+	fi
+	TX_PATHS+=("$path")
+	TX_SNAPS+=("$snap")
+}
+
+function tx_commit {
+	# Disarm the trap first: from here on the configuration is validated, so a
+	# failing snapshot cleanup must not trigger a rollback of committed state.
+	TX_ACTIVE=0
+	trap - EXIT
+
+	local i
+	if [ "${#TX_SNAPS[@]}" -gt 0 ]
+	then
+		for i in "${!TX_SNAPS[@]}"
+		do
+			if [ -n "${TX_SNAPS[$i]}" ]
+			then
+				rm -f "${TX_SNAPS[$i]}" || print_warn "tx_commit: could not remove snapshot ${TX_SNAPS[$i]}"
+			fi
+		done
+	fi
+	TX_PATHS=()
+	TX_SNAPS=()
+}
+
+function tx_rollback {
+	if [ "$TX_ACTIVE" != "1" ]
+	then
+		return 0
+	fi
+	TX_ACTIVE=0
+	trap - EXIT
+
+	local i path snap restored=0 failed=0
+	if [ "${#TX_PATHS[@]}" -gt 0 ]
+	then
+		for i in "${!TX_PATHS[@]}"
+		do
+			path="${TX_PATHS[$i]}"
+			snap="${TX_SNAPS[$i]}"
+			if [ -n "$snap" ] && [ -f "$snap" ]
+			then
+				# A rollback must never abort halfway: every step is guarded so
+				# the remaining files still get restored.
+				if cp -a "$snap" "$path"
+				then
+					rm -f "$snap" || true
+					restored=$((restored + 1))
+				else
+					failed=$((failed + 1))
+					print_warn "tx_rollback: could not restore $path from $snap"
+				fi
+			elif [ -e "$path" ]
+			then
+				if rm -f "$path"
+				then
+					restored=$((restored + 1))
+				else
+					failed=$((failed + 1))
+					print_warn "tx_rollback: could not remove $path"
+				fi
+			fi
+		done
+	fi
+
+	TX_PATHS=()
+	TX_SNAPS=()
+	if [ "$restored" -gt 0 ]
+	then
+		print_warn "Rolled back $restored nginx configuration file(s) changed by this run"
+	fi
+	if [ "$failed" -gt 0 ]
+	then
+		print_warn "tx_rollback: $failed file(s) could NOT be restored; manual inspection required"
+	fi
+}
+
+# OpenVZ / LXC share the host kernel: the clock is host-managed and swapon is
+# not permitted inside the container, so both must be skipped there.
+function is_container_virt {
+	case "$1" in
+	openvz|lxc)
+		return 0
+		;;
+	esac
+	return 1
+}
+
+function is_uint {
+	case "${1:-}" in
+	''|*[!0-9]*)
+		return 1
+		;;
+	esac
+	# `[ ]` is 64-bit: a longer digit string makes it emit
+	# "integer expression expected" and take the wrong branch. Real values here
+	# are MB/GB totals, so anything beyond 18 digits is treated as unparseable.
+	if [ "${#1}" -gt 18 ]
+	then
+		return 1
+	fi
+	return 0
+}
+
+# Remove every root crontab line matching an extended regex.
+# Uses a variable instead of a bare `crontab -l | grep -v ... | crontab -`
+# pipeline: under `set -e` + `pipefail` an empty filter result makes grep exit
+# 1 and would abort the whole script.
+function prune_cron_pattern {
+	local pattern="$1"
+	local cur_cron filtered
+
+	if ! command -v crontab >/dev/null 2>&1
+	then
+		print_warn "crontab is not available; skipping crontab pruning for: $pattern"
+		return 0
+	fi
+
+	cur_cron=$(crontab -l 2>/dev/null || true)
+	[ -n "$cur_cron" ] || return 0
+
+	filtered=$(printf '%s\n' "$cur_cron" | grep -v "$pattern" || true)
+	if [ "$filtered" = "$cur_cron" ]
+	then
+		return 0
+	fi
+
+	if [ -n "$filtered" ]
+	then
+		printf '%s\n' "$filtered" | crontab -
+	else
+		printf '' | crontab -
+	fi
+	print_info "Pruned legacy crontab entries matching: $pattern"
+}
+
 function detect_php_version {
 	php_version=$(dpkg -l 'php*-fpm' 2>/dev/null | awk '/^ii  php[0-9]+\.[0-9]+-fpm/ {print $2}' | sed 's/^php//; s/-fpm$//' | head -n1)
 	if [ -z "$php_version" ]
@@ -116,6 +308,199 @@ function ensure_timezone {
 		dpkg-reconfigure -f noninteractive tzdata
 	fi
 	print_info "Timezone set to Asia/Shanghai"
+}
+
+############################################################
+# system baseline hardening
+############################################################
+
+function configure_journald {
+	print_info "Configuring systemd-journald size limits (50M cap)"
+	mkdir -p /etc/systemd/journald.conf.d
+	backup_file /etc/systemd/journald.conf.d/00-journal-size.conf pre-journal-limit-backup
+	cat > /etc/systemd/journald.conf.d/00-journal-size.conf <<'END'
+# Managed by setup-debian13.sh: keep the journal from filling the root filesystem.
+[Journal]
+SystemMaxUse=50M
+SystemMaxFileSize=10M
+RuntimeMaxUse=20M
+MaxRetentionSec=1month
+END
+	systemctl restart systemd-journald ||
+		print_warn "systemd-journald restart failed; the 50M cap applies at its next start"
+	journalctl --vacuum-size=50M >/dev/null 2>&1 || true
+	print_info "Journald limited to 50M"
+}
+
+function configure_timesync {
+	print_info "Configuring continuous time synchronization"
+	ensure_timezone
+
+	local virt_type
+	virt_type=$(detect_virt_type)
+	if is_container_virt "$virt_type"
+	then
+		print_warn "Container environment ($virt_type) detected: the clock is managed by the host. Skipping systemd-timesyncd."
+		return 0
+	fi
+
+	# systemd-timesyncd is shipped with systemd itself; check_install also works
+	# with an absolute path, so this is a no-op on a standard install.
+	check_install /usr/lib/systemd/systemd-timesyncd systemd-timesyncd
+	systemctl unmask systemd-timesyncd >/dev/null 2>&1 || true
+	systemctl enable systemd-timesyncd >/dev/null 2>&1 || true
+	systemctl restart systemd-timesyncd ||
+		print_warn "systemd-timesyncd did not start; check 'systemctl status systemd-timesyncd'"
+	timedatectl set-ntp true >/dev/null 2>&1 || true
+
+	# ntpdate does destructive one-shot jumps and is gone from Debian 12/13.
+	prune_cron_pattern 'ntpdate'
+	print_info "Continuous time synchronization active via systemd-timesyncd"
+}
+
+function configure_sysctl {
+	print_info "Applying security sysctl parameters (anti-spoofing)"
+	mkdir -p /etc/sysctl.d
+	backup_file /etc/sysctl.d/99-security.conf pre-sysctl-security-backup
+	cat > /etc/sysctl.d/99-security.conf <<'END'
+# Managed by setup-debian13.sh.
+# Reverse-path filtering: drop packets whose source address cannot be routed back.
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+# SYN cookies: keep accepting connections while under a SYN flood.
+net.ipv4.tcp_syncookies = 1
+END
+	sysctl -p /etc/sysctl.d/99-security.conf >/dev/null 2>&1 || print_warn "sysctl -p failed; the parameters take effect after reboot"
+	print_info "Kernel network anti-spoofing enabled"
+}
+
+function configure_cron_safety {
+	print_info "Securing root crontab against dead-mail spool overflow"
+
+	if ! command -v crontab >/dev/null 2>&1
+	then
+		print_warn "crontab is not available; skipping MAILTO hardening"
+		return 0
+	fi
+
+	local cur_cron clean_cron
+	cur_cron=$(crontab -l 2>/dev/null || true)
+
+	if printf '%s\n' "$cur_cron" | grep -q '^MAILTO=""'
+	then
+		print_info 'MAILTO="" already present in root crontab'
+		return 0
+	fi
+
+	clean_cron=$(printf '%s\n' "$cur_cron" | grep -v '^MAILTO=' || true)
+	if [ -n "$clean_cron" ]
+	then
+		printf 'MAILTO=""\n%s\n' "$clean_cron" | crontab -
+	else
+		printf 'MAILTO=""\n' | crontab -
+	fi
+	print_info 'Injected MAILTO="" into root crontab'
+}
+
+function configure_swap_safety {
+	print_info "Checking memory and swap safety margin"
+
+	local virt_type
+	virt_type=$(detect_virt_type)
+	if is_container_virt "$virt_type"
+	then
+		print_warn "Container environment ($virt_type) detected: swapon is not permitted. Skipping the safety swapfile."
+		return 0
+	fi
+
+	local total_ram_mb total_swap_mb
+	total_ram_mb=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || true)
+	total_swap_mb=$(free -m 2>/dev/null | awk '/^Swap:/{print $2}' || true)
+
+	# Validate before comparing: `[ "" -gt 1024 ]` aborts the shell, and a
+	# non-numeric value would make the branch decision on an error, not a fact.
+	if ! is_uint "$total_ram_mb" || ! is_uint "$total_swap_mb"
+	then
+		print_warn "Could not read memory/swap totals from 'free'; skipping the safety swapfile"
+		return 0
+	fi
+
+	# Only <=1GB hosts that have no swap at all need the protective swapfile.
+	if [ "$total_ram_mb" -gt 1024 ] || [ "$total_swap_mb" -ne 0 ]
+	then
+		return 0
+	fi
+
+	if swapon --show 2>/dev/null | grep -q .
+	then
+		print_info "Swap is already active; skipping the safety swapfile"
+		return 0
+	fi
+
+	local free_disk_gb
+	free_disk_gb=$(df -BG "$(dirname "$SWAPFILE_PATH")" 2>/dev/null | awk 'NR==2{sub(/G/,"",$4); print $4}')
+	if ! is_uint "$free_disk_gb" || [ "$free_disk_gb" -lt 2 ]
+	then
+		print_warn "Not enough free space for a 512M safety swapfile at $SWAPFILE_PATH; skipping"
+		return 0
+	fi
+
+	if [ -e "$SWAPFILE_PATH" ]
+	then
+		print_warn "An inactive $SWAPFILE_PATH already exists; leaving it untouched for manual review"
+		return 0
+	fi
+
+	print_info "Low RAM (<=1GB) with zero swap detected. Creating a 512MB safety swapfile at $SWAPFILE_PATH"
+
+	# Every step between creating and activating the file must clean up after
+	# itself: a half-built file would trigger the "already exists" branch above
+	# on the next run and block the retry forever.
+	if ! { fallocate -l 512M "$SWAPFILE_PATH" 2>/dev/null || dd if=/dev/zero of="$SWAPFILE_PATH" bs=1M count=512 status=none; }
+	then
+		print_warn "Could not create $SWAPFILE_PATH; skipping the safety swapfile"
+		rm -f "$SWAPFILE_PATH"
+		return 0
+	fi
+
+	if ! chmod 600 "$SWAPFILE_PATH"
+	then
+		print_warn "chmod 600 $SWAPFILE_PATH failed; removing the incomplete swapfile"
+		rm -f "$SWAPFILE_PATH"
+		return 0
+	fi
+
+	if ! mkswap "$SWAPFILE_PATH" >/dev/null 2>&1
+	then
+		print_warn "mkswap $SWAPFILE_PATH failed; removing the incomplete swapfile"
+		rm -f "$SWAPFILE_PATH"
+		return 0
+	fi
+
+	if ! swapon "$SWAPFILE_PATH"
+	then
+		print_warn "swapon $SWAPFILE_PATH failed; removing the incomplete swapfile"
+		rm -f "$SWAPFILE_PATH"
+		return 0
+	fi
+
+	# Persist only what is actually active. A failure here leaves swap working
+	# for this boot, so warn instead of aborting the whole 'system' branch.
+	if ! grep -q "^$SWAPFILE_PATH " /etc/fstab
+	then
+		printf '%s none swap sw 0 0\n' "$SWAPFILE_PATH" >> /etc/fstab ||
+			print_warn "Could not add $SWAPFILE_PATH to /etc/fstab; swap is active but will not survive a reboot"
+	fi
+	if mkdir -p /etc/sysctl.d
+	then
+		printf 'vm.swappiness=10\n' > /etc/sysctl.d/99-swap.conf ||
+			print_warn "Could not write /etc/sysctl.d/99-swap.conf"
+		sysctl -p /etc/sysctl.d/99-swap.conf >/dev/null 2>&1 ||
+			print_warn "sysctl -p failed; vm.swappiness takes effect after reboot"
+	else
+		print_warn "Could not create /etc/sysctl.d; vm.swappiness was not set"
+	fi
+	print_info "Allocated 512MB safety swapfile at $SWAPFILE_PATH; vm.swappiness set to 10"
 }
 
 ############################################################
@@ -211,7 +596,15 @@ cron.*                                                  -/var/log/cron
 mail.*                                                  -/var/log/mail
 END
 
-	backup_file /etc/logrotate.d/rsyslog-custom pre-rsyslog-logrotate-backup
+	# NOTE: never place the backup inside /etc/logrotate.d — logrotate parses
+	# every file in that directory, so a timestamped copy would be read as a
+	# second rule and make logrotate fail with "duplicate log entry".
+	if [ -f /etc/logrotate.d/rsyslog-custom ]
+	then
+		mkdir -p /var/backups/setup-debian13
+		cp /etc/logrotate.d/rsyslog-custom "/var/backups/setup-debian13/rsyslog-custom.$(date +%F_%H%M%S).prev"
+		print_info "Backup created: /var/backups/setup-debian13/rsyslog-custom.<timestamp>.prev"
+	fi
 	cat > /etc/logrotate.d/rsyslog-custom <<'END'
 /var/log/messages
 /var/log/cron
@@ -275,6 +668,7 @@ function install_php {
 	php_version=$(detect_php_version)
 	php_ini="/etc/php/$php_version/fpm/php.ini"
 	fpm_service="php$php_version-fpm"
+	fpm_pool="/etc/php/$php_version/fpm/pool.d/www.conf"
 
 	[ -f "$php_ini" ] || die "PHP ini not found at $php_ini"
 	backup_file "$php_ini" pre-php-ini-backup
@@ -289,23 +683,164 @@ function install_php {
 		printf '\ncgi.fix_pathinfo=0\n' >> "$php_ini"
 	fi
 
+	# date.timezone is commented out by default; the sed may not match every
+	# packaging variant, so verify and append as a fallback.
+	if grep -q '^;*date\.timezone' "$php_ini"
+	then
+		sed -i "s|^;*date\.timezone =.*|date.timezone = Asia/Shanghai|" "$php_ini"
+	fi
+	if ! grep -q '^date\.timezone = Asia/Shanghai' "$php_ini"
+	then
+		printf '\ndate.timezone = Asia/Shanghai\n' >> "$php_ini"
+	fi
+
+	# Recycle every worker after 500 requests so long-running processes cannot
+	# accumulate memory leaks.
+	if [ -f "$fpm_pool" ]
+	then
+		backup_file "$fpm_pool" pre-php-fpm-pool-backup
+		if grep -q '^;*pm\.max_requests' "$fpm_pool"
+		then
+			sed -i "s|^;*pm\.max_requests =.*|pm.max_requests = 500|" "$fpm_pool"
+		else
+			printf '\npm.max_requests = 500\n' >> "$fpm_pool"
+		fi
+	else
+		print_warn "PHP-FPM pool not found at $fpm_pool; skipping pm.max_requests"
+	fi
+
 	systemctl enable "$fpm_service"
 	systemctl restart "$fpm_service"
 	print_info "PHP $php_version configured"
 }
 
+# A single listen address:port may only be claimed by one default_server.
+# The anti-SNI block is written into the default site by install_nginx itself,
+# so any *other* loaded file declaring a 443 default_server would make
+# `nginx -t` fail with "a duplicate default server". Warn instead of silently
+# rewriting files the operator may own.
+# Only files nginx actually loads are inspected: sites-available is not part of
+# nginx.conf, and scanning it would flag our own timestamped backups.
+function check_reject_sni_conflicts {
+	local conf conflicts=""
+	local default_real
+	default_real=$(readlink -f /etc/nginx/sites-available/default 2>/dev/null || true)
+
+	for conf in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*
+	do
+		[ -f "$conf" ] || continue
+		if [ -n "$default_real" ] && [ "$(readlink -f "$conf" 2>/dev/null || true)" = "$default_real" ]
+		then
+			continue
+		fi
+		if grep -Eq '^[[:space:]]*listen[[:space:]]+(\[::\]:)?443[^;]*default_server' "$conf"
+		then
+			conflicts="$conflicts $conf"
+		fi
+	done
+
+	if [ -n "$conflicts" ]
+	then
+		print_warn "Another nginx file also declares a 443 default_server:$conflicts"
+		print_warn "That will make 'nginx -t' fail. Remove the duplicate 'default_server' keyword and re-run."
+	fi
+}
+
+# Global logrotate policy for every vhost log written under /var/www.
+# daily + maxsize 10M keeps a single file bounded even on busy sites, and the
+# 14-day retention replaces the previous unmanaged growth.
+function ensure_vhost_logrotate {
+	print_info "Ensuring logrotate policy for /var/www vhost logs"
+
+	# Non-critical helper: it is also called from install_site/install_wordpress
+	# outside any transaction, so it must not abort them on its own failure.
+	if ! mkdir -p /etc/logrotate.d
+	then
+		print_warn "Could not create /etc/logrotate.d; skipping the vhost logrotate policy"
+		return 0
+	fi
+
+	local rule
+	rule=$(mktemp /tmp/custom-vhosts.XXXXXX)
+	cat > "$rule" <<'END'
+# Managed by setup-debian13.sh.
+/var/www/*/*.log /var/www/*/logs/*.log {
+	daily
+	maxsize 10M
+	rotate 14
+	compress
+	delaycompress
+	missingok
+	notifempty
+	create 0640 www-data adm
+	sharedscripts
+	postrotate
+		if [ -d /run/systemd/system ]; then
+			systemctl reload nginx > /dev/null 2>&1 || true
+		fi
+	endscript
+}
+END
+
+	# logrotate reads every file in /etc/logrotate.d, so a timestamped backup
+	# left in that directory would itself be parsed as a second rule and make
+	# logrotate fail with "duplicate log entry" on every run. Backups therefore
+	# go to /var/backups, and an unchanged rule is left completely alone.
+	if [ -f /etc/logrotate.d/custom-vhosts ] && cmp -s "$rule" /etc/logrotate.d/custom-vhosts
+	then
+		rm -f "$rule"
+		print_info "logrotate policy already up to date"
+		return 0
+	fi
+
+	if [ -f /etc/logrotate.d/custom-vhosts ]
+	then
+		mkdir -p /var/backups/setup-debian13
+		cp /etc/logrotate.d/custom-vhosts "/var/backups/setup-debian13/custom-vhosts.$(date +%F_%H%M%S).prev"
+		print_info "Backup created: /var/backups/setup-debian13/custom-vhosts.$(date +%F_%H%M%S).prev"
+	fi
+
+	if ! mv "$rule" /etc/logrotate.d/custom-vhosts
+	then
+		rm -f "$rule"
+		print_warn "Could not install /etc/logrotate.d/custom-vhosts"
+		return 0
+	fi
+	print_info "logrotate policy installed at /etc/logrotate.d/custom-vhosts"
+}
+
 function install_nginx {
 	print_info "Installing nginx and writing safe default configuration"
 	DEBIAN_FRONTEND=noninteractive apt-get -q -y install nginx
+	check_install logrotate logrotate
 
-	php_version=$(detect_php_version)
+	# PHP-FPM may not be installed yet: install_nginx is also valid standalone.
+	# Degrade to an html-only default site instead of aborting the whole run.
+	# NOTE: the `||` must wrap the assignment — `detect_php_version` calls `die`,
+	# whose `exit 1` runs inside the command substitution subshell, so
+	# `$(detect_php_version || true)` would still abort under `set -e`.
+	php_version=""
+	php_version=$(detect_php_version) || php_version=""
 	php_sock="/run/php/php$php_version-fpm.sock"
 
 	mkdir -p /var/www/default/public /etc/nginx/snippets
 	echo 'Default nginx site is ready.' > /var/www/default/public/index.html
 
-	backup_file /etc/nginx/snippets/php-fpm.conf pre-nginx-php-snippet-backup
-	cat > /etc/nginx/snippets/php-fpm.conf <<END
+	check_reject_sni_conflicts
+
+	# Everything below rewrites live nginx configuration, so it runs inside a
+	# transaction: each target is snapshotted just before it is modified, and an
+	# EXIT trap restores them all if any step fails (`set -e` aborts on the first
+	# failing command, including the ones before `nginx -t`). A single listen
+	# directive may only have one default_server, and the 443 reject block below
+	# lives in this very file so a fresh install can never conflict.
+	tx_begin
+
+	if [ -n "$php_version" ]
+	then
+		tx_add /etc/nginx/snippets/php-fpm.conf
+		backup_file /etc/nginx/snippets/php-fpm.conf pre-nginx-php-snippet-backup
+		cat > /etc/nginx/snippets/php-fpm.conf <<END
 location / {
 	try_files \$uri \$uri/ /index.php?\$query_string;
 }
@@ -320,9 +855,14 @@ location ~ /\.ht {
 	deny all;
 }
 END
+	else
+		print_warn "PHP-FPM not detected; skipping the PHP snippet (run '$(basename "$0") php' later)"
+	fi
 
+	tx_add /etc/nginx/sites-available/default
 	backup_file /etc/nginx/sites-available/default pre-nginx-default-site-backup
 	cat > /etc/nginx/sites-available/default <<'END'
+# Managed by setup-debian13.sh.
 server {
 	listen 80 default_server;
 	listen [::]:80 default_server;
@@ -334,18 +874,43 @@ server {
 		try_files $uri $uri/ =404;
 	}
 }
+
+# Anti-SNI: drop TLS handshakes for direct-IP probes and unknown SNI values
+# instead of falling back to the first SSL vhost and leaking its certificate.
+# ssl_reject_handshake needs no certificate; real vhosts (listen 443 ssl without
+# default_server) keep working because SNI matching takes priority.
+server {
+	listen 443 ssl default_server;
+	listen [::]:443 ssl default_server;
+	server_name _;
+	ssl_reject_handshake on;
+}
 END
+
+	# The logrotate rule is part of the same transaction: a later failure must
+	# not leave it deployed against a configuration that never validated.
+	tx_add /etc/logrotate.d/custom-vhosts
+	ensure_vhost_logrotate
 
 	if [ -f /etc/nginx/nginx.conf ]
 	then
+		tx_add /etc/nginx/nginx.conf
 		backup_file /etc/nginx/nginx.conf pre-nginx-conf-backup
 		sed -i 's/worker_processes .*/worker_processes auto;/' /etc/nginx/nginx.conf
 	fi
 
-	nginx -t || die "nginx configuration test failed"
+	# Validate before committing. If the test fails — or if any earlier step
+	# already aborted under `set -e` — the EXIT trap restores every file this
+	# run touched, so the machine never keeps an unloadable nginx config.
+	if ! nginx -t
+	then
+		die "nginx configuration test failed"
+	fi
+	tx_commit
+
 	systemctl enable nginx
 	systemctl restart nginx
-	print_info "nginx configured with safe default site"
+	print_info "nginx configured with safe default site and anti-SNI rejection"
 }
 
 function install_site {
@@ -441,6 +1006,7 @@ END
 
 	ln -s "$site_conf" "$site_link"
 	chown -R www-data:www-data "$site_root"
+	ensure_vhost_logrotate
 	nginx -t || die "nginx configuration test failed for $domain"
 	systemctl reload nginx
 
@@ -550,6 +1116,7 @@ server {
 END
 	ln -s "$site_conf" "$site_link"
 	chown -R www-data:www-data "$site_root"
+	ensure_vhost_logrotate
 	nginx -t || die "nginx configuration test failed for WordPress site $domain"
 	systemctl reload nginx
 
@@ -833,8 +1400,14 @@ info)
 	show_os_arch_version
 	;;
 system)
-	ensure_timezone
+	# Refresh apt lists first: the baseline functions below may install packages.
 	update_upgrade
+	ensure_timezone
+	configure_timesync
+	configure_journald
+	configure_sysctl
+	configure_cron_safety
+	configure_swap_safety
 	install_vim
 	install_htop
 	install_mc
@@ -849,8 +1422,8 @@ system)
 	echo '  '
 	echo 'Usage:' "$(basename "$0")" '[option] [argument]'
 	echo 'Primary commands:'
-	echo '  - system                 (set Asia/Shanghai timezone, update system, install base tools, configure rsyslog)' 
-	echo '  - nginx                  (install nginx and create a safe default site)'
+	echo '  - system                 (baseline hardening: timezone, timesyncd, journald 50M, sysctl, cron MAILTO, safety swap, base tools, rsyslog)'
+	echo '  - nginx                  (install nginx with a safe default site, 443 anti-SNI rejection and vhost logrotate)'
 	echo '  - php                    (install PHP-FPM and common development extensions)'
 	echo '  - site      [domain.tld] (create nginx vhost and /var/www/domain/public)'
 	echo '  - ps_mem                 (install ps_mem helper)'
