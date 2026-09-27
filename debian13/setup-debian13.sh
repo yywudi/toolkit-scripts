@@ -714,36 +714,160 @@ function install_php {
 	print_info "PHP $php_version configured"
 }
 
-# A single listen address:port may only be claimed by one default_server.
-# The anti-SNI block is written into the default site by install_nginx itself,
-# so any *other* loaded file declaring a 443 default_server would make
-# `nginx -t` fail with "a duplicate default server". Warn instead of silently
-# rewriting files the operator may own.
-# Only files nginx actually loads are inspected: sites-available is not part of
-# nginx.conf, and scanning it would flag our own timestamped backups.
-function check_reject_sni_conflicts {
-	local conf conflicts=""
-	local default_real
-	default_real=$(readlink -f /etc/nginx/sites-available/default 2>/dev/null || true)
+# --- NGX-SNI-1 anti-SNI -------------------------------------------------------
+# A single listen address:port may only be claimed once per nginx process: when a
+# `stream` block doing ssl_preread multiplexing and an `http` server both listen
+# on 443, nginx dies at startup with
+#   bind() to 0.0.0.0:443 failed (98: Address already in use)
+# while `nginx -t` still passes and `systemctl reload` aborts silently (the old
+# workers keep serving), so the breakage only surfaces at the next real restart.
+# The two fixes are therefore mutually exclusive:
+#   stream owns 443 -> never write an http-layer `listen 443`   (Fix 2)
+#   http owns 443   -> write the conf.d drop-in, never inline    (Fix 1)
+# Helper names match the server-audit skill's audit_probe.sh so the two tools
+# cannot drift apart.
 
-	for conf in /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/*
-	do
-		[ -f "$conf" ] || continue
-		if [ -n "$default_real" ] && [ "$(readlink -f "$conf" 2>/dev/null || true)" = "$default_real" ]
-		then
-			continue
-		fi
-		if grep -Eq '^[[:space:]]*listen[[:space:]]+(\[::\]:)?443[^;]*default_server' "$conf"
-		then
-			conflicts="$conflicts $conf"
-		fi
-	done
+# Is 443 already claimed by the `stream` block (ssl_preread front-end
+# multiplexing)? If so, no http-layer 443 listener may exist. The merged
+# configuration from `nginx -T` is the only complete view — a stream block may
+# live in an included file — and brace counting keeps the scan inside that
+# block, so an http-layer `listen 443` can never be mistaken for a stream one.
+function nginx_stream_owns_443 {
+	local dumped
+	command -v nginx >/dev/null 2>&1 || return 1
+	dumped=$(nginx -T 2>/dev/null) || true
+	[ -n "$dumped" ] || return 1
+	awk '
+		/^[[:space:]]*stream[[:space:]]*\{/ { depth = 1; next }
+		depth > 0 {
+			if ($0 ~ /^[[:space:]]*listen[[:space:]]+([^;[:space:]]*:)?443([[:space:];]|$)/) { found = 1 }
+			line = $0
+			sub(/#.*/, "", line)
+			depth += gsub(/\{/, "{", line)
+			depth -= gsub(/\}/, "}", line)
+		}
+		END { exit(found ? 0 : 1) }
+	' <<<"$dumped"
+}
 
-	if [ -n "$conflicts" ]
+# Does this instance already serve an http-layer 443 default_server? Only the
+# merged configuration from `nginx -T` can answer that: `grep -r /etc/nginx` does
+# not follow the sites-enabled symlinks and would miss such a file. The address
+# part is optional in the match, so an IP-bound default_server counts too:
+# `nginx -t` tolerates `listen 1.2.3.4:443 ssl default_server` next to a wildcard
+# one, but bind() does not — the second listener fails with EADDRINUSE.
+function nginx_http_has_443_default {
+	local dumped
+	command -v nginx >/dev/null 2>&1 || return 1
+	dumped=$(nginx -T 2>/dev/null) || true
+	[ -n "$dumped" ] || return 1
+	grep -qE '^[[:space:]]*listen[[:space:]]+([^;[:space:]]*:)?443([[:space:];]|$)[^;]*default_server' <<<"$dumped"
+}
+
+# 判定 reload 后 nginx 是否真的活着（nginx -t 看不到 bind 冲突）。
+# Kept behaviourally identical to the server-audit skill's audit_probe.sh.
+# Both probes read their input into a variable first: under `set -o pipefail` a
+# `grep -q` that exits early kills the producer with SIGPIPE and turns a hit into
+# a miss, which here would read as "no bind() emerg" on a broken reload.
+function nginx_reload_verified {
+	local since journal listeners
+	since=$(date '+%Y-%m-%d %H:%M:%S')
+	systemctl reload nginx >/dev/null 2>&1 || true
+	sleep 1
+	journal=$(journalctl -u nginx --since "$since" --no-pager 2>/dev/null) || true
+	if grep -q '\[emerg\] bind()' <<<"$journal"
 	then
-		print_warn "Another nginx file also declares a 443 default_server:$conflicts"
-		print_warn "That will make 'nginx -t' fail. Remove the duplicate 'default_server' keyword and re-run."
+		return 1
 	fi
+	# reload 可能被静默中止，再用监听端口复核
+	listeners=$(ss -tln 2>/dev/null) || true
+	grep -qE ':443[[:space:]]' <<<"$listeners" || return 1
+	return 0
+}
+
+# Copies of retired nginx files belong outside /etc/nginx: a leftover .bak/.prev
+# in the live directory makes every later rg/grep hit dead configuration. Only
+# the 5 most recent copies of each file are kept, so the archive stays a trace
+# instead of growing forever.
+function archive_nginx_file { # archive_nginx_file <path> <tag>
+	local dir=/root/.nginx-sni-pre
+	local name dest
+	[ -e "$1" ] || return 0
+	name=$(basename "$1")
+	mkdir -p "$dir"
+	dest="$dir/$name.$(date +%F_%H%M%S).$2"
+	cp -a "$1" "$dest"
+	print_info "Archived $1 -> $dest"
+	find "$dir" -maxdepth 1 -type f -name "$name.*" -printf '%T@ %p\n' 2>/dev/null |
+		sort -rn | tail -n +6 | cut -d' ' -f2- | xargs -r -d '\n' rm -f || true
+}
+
+# The 443 anti-SNI default server: reject the TLS handshake for direct-IP probes
+# and unmatched SNI instead of falling back to the first TLS vhost, which would
+# hand out that vhost's certificate and leak the hosted domain names.
+# It lives in its own conf.d file and is never inlined in
+# sites-available/default: that file is an nginx-common conffile, and editing it
+# makes every apt upgrade of the package drop a .dpkg-dist/.dpkg-new next to it.
+function install_reject_sni_conf {
+	local conf=/etc/nginx/conf.d/00-reject-sni.conf
+
+	# Anything at that path that is not our managed file belongs to the operator:
+	# never archive or delete it, in either branch below. Only the first line
+	# counts as the marker, so an operator file that merely mentions it stays
+	# untouched.
+	if [ -f "$conf" ] && ! head -n1 "$conf" | grep -q '^# NGX-SNI-1 managed file'
+	then
+		print_warn "$conf exists and is not managed by this script; leaving it untouched"
+		return 0
+	fi
+
+	# If the merged configuration cannot be read, do not guess: writing a wildcard
+	# 443 listener on a host whose 443 is already taken is exactly the outage this
+	# check exists to prevent.
+	if ! nginx -T >/dev/null 2>&1
+	then
+		print_warn "nginx -T cannot read the configuration; skipping the anti-SNI drop-in"
+		return 0
+	fi
+
+	if nginx_stream_owns_443
+	then
+		if [ -f "$conf" ]
+		then
+			# A drop-in left by an earlier revision is what killed hosts in this
+			# fleet: it adds a second *:443 listener to a process that already
+			# binds 443 in `stream`. Retire it instead of reporting it forever —
+			# no tx_add, because a rollback must not put a conflicting listener
+			# back; the content stays in the archive directory.
+			archive_nginx_file "$conf" reject-sni-stream-conflict
+			rm -f "$conf"
+			print_warn "443 is owned by the nginx 'stream' block: removed $conf (a second *:443 listener cannot bind)"
+		else
+			print_info "443 is owned by the nginx 'stream' block: skipping the http-layer anti-SNI drop-in"
+		fi
+		return 0
+	fi
+
+	# Our own file is rewritten below, so only a foreign one can be a conflict.
+	if [ ! -f "$conf" ] && nginx_http_has_443_default
+	then
+		print_warn "Another nginx file already declares a 443 default_server; skipping the anti-SNI drop-in"
+		return 0
+	fi
+
+	mkdir -p /etc/nginx/conf.d
+	tx_add "$conf"
+	cat > "$conf" <<'END'
+# NGX-SNI-1 managed file — do not edit by hand
+# 反 SNI 探测：直连 IP / 未匹配 SNI 一律在 TLS 握手阶段拒绝，不下发任何证书。
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+    ssl_reject_handshake on;
+}
+END
+	print_info "Anti-SNI drop-in written: $conf"
 }
 
 # Global logrotate policy for every vhost log written under /var/www.
@@ -826,8 +950,6 @@ function install_nginx {
 	mkdir -p /var/www/default/public /etc/nginx/snippets
 	echo 'Default nginx site is ready.' > /var/www/default/public/index.html
 
-	check_reject_sni_conflicts
-
 	# Everything below rewrites live nginx configuration, so it runs inside a
 	# transaction: each target is snapshotted just before it is modified, and an
 	# EXIT trap restores them all if any step fails (`set -e` aborts on the first
@@ -839,7 +961,7 @@ function install_nginx {
 	if [ -n "$php_version" ]
 	then
 		tx_add /etc/nginx/snippets/php-fpm.conf
-		backup_file /etc/nginx/snippets/php-fpm.conf pre-nginx-php-snippet-backup
+		archive_nginx_file /etc/nginx/snippets/php-fpm.conf previous-php-snippet
 		cat > /etc/nginx/snippets/php-fpm.conf <<END
 location / {
 	try_files \$uri \$uri/ /index.php?\$query_string;
@@ -860,7 +982,7 @@ END
 	fi
 
 	tx_add /etc/nginx/sites-available/default
-	backup_file /etc/nginx/sites-available/default pre-nginx-default-site-backup
+	archive_nginx_file /etc/nginx/sites-available/default previous-default-site
 	cat > /etc/nginx/sites-available/default <<'END'
 # Managed by setup-debian13.sh.
 server {
@@ -874,18 +996,12 @@ server {
 		try_files $uri $uri/ =404;
 	}
 }
-
-# Anti-SNI: drop TLS handshakes for direct-IP probes and unknown SNI values
-# instead of falling back to the first SSL vhost and leaking its certificate.
-# ssl_reject_handshake needs no certificate; real vhosts (listen 443 ssl without
-# default_server) keep working because SNI matching takes priority.
-server {
-	listen 443 ssl default_server;
-	listen [::]:443 ssl default_server;
-	server_name _;
-	ssl_reject_handshake on;
-}
 END
+
+	# The 443 anti-SNI default server goes to its own conf.d file, never inline
+	# above: a previous revision inlined it here, which both edited an
+	# nginx-common conffile and collided with Stream-443 hosts.
+	install_reject_sni_conf
 
 	# The logrotate rule is part of the same transaction: a later failure must
 	# not leave it deployed against a configuration that never validated.
@@ -895,7 +1011,7 @@ END
 	if [ -f /etc/nginx/nginx.conf ]
 	then
 		tx_add /etc/nginx/nginx.conf
-		backup_file /etc/nginx/nginx.conf pre-nginx-conf-backup
+		archive_nginx_file /etc/nginx/nginx.conf previous-nginx-conf
 		sed -i 's/worker_processes .*/worker_processes auto;/' /etc/nginx/nginx.conf
 	fi
 
@@ -906,11 +1022,36 @@ END
 	then
 		die "nginx configuration test failed"
 	fi
-	tx_commit
 
 	systemctl enable nginx
-	systemctl restart nginx
-	print_info "nginx configured with safe default site and anti-SNI rejection"
+	# A real restart is the only thing that surfaces a bind() conflict (nginx -t
+	# tolerates e.g. an IP-bound listener next to the wildcard one), and it stops
+	# the old workers first, so a failure must restore the files AND say so.
+	if ! systemctl restart nginx
+	then
+		tx_rollback
+		# The old configuration was verified before this run, so bring the service
+		# back up with it instead of leaving nginx stopped.
+		if systemctl restart nginx >/dev/null 2>&1
+		then
+			print_warn "the new configuration failed to start; the previous configuration was restored and nginx is running again"
+		else
+			print_warn "nginx is not running: inspect 'journalctl -u nginx', then run 'systemctl restart nginx'"
+		fi
+		exit 1
+	fi
+	# Commit as soon as the files on disk match the running process: leaving the
+	# transaction open here would let an external signal roll the disk back under
+	# a live nginx (and the next reload would silently load the old config).
+	tx_commit
+	# `nginx -t` never binds a socket and a silently aborted reload keeps the old
+	# workers alive, so confirm the listener as well.
+	if ! nginx_reload_verified
+	then
+		print_warn "the anti-SNI listener could not be verified; check 'journalctl -u nginx' for '[emerg] bind()' and 'ss -tln | grep :443'"
+	fi
+
+	print_info "nginx configured with safe default site"
 }
 
 function install_site {
@@ -1008,7 +1149,12 @@ END
 	chown -R www-data:www-data "$site_root"
 	ensure_vhost_logrotate
 	nginx -t || die "nginx configuration test failed for $domain"
-	systemctl reload nginx
+	# `nginx -t` never binds a socket: a reload that cannot bind fails silently
+	# and leaves the old workers serving, so confirm the listener came up.
+	if ! nginx_reload_verified
+	then
+		print_warn "nginx reload could not be verified; check 'journalctl -u nginx'"
+	fi
 
 	print_warn "New site successfully installed."
 	print_warn "Document root: $site_public"
@@ -1118,7 +1264,11 @@ END
 	chown -R www-data:www-data "$site_root"
 	ensure_vhost_logrotate
 	nginx -t || die "nginx configuration test failed for WordPress site $domain"
-	systemctl reload nginx
+	# Same as install_site: never trust `nginx -t` alone for a live reload.
+	if ! nginx_reload_verified
+	then
+		print_warn "nginx reload could not be verified; check 'journalctl -u nginx'"
+	fi
 
 	print_warn "New WordPress site successfully installed."
 	print_warn "Document root: $site_public"
