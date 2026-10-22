@@ -673,9 +673,40 @@ function install_php {
 	[ -f "$php_ini" ] || die "PHP ini not found at $php_ini"
 	backup_file "$php_ini" pre-php-ini-backup
 
-	sed -i "s/^upload_max_filesize = .*/upload_max_filesize = 200M/" "$php_ini"
-	sed -i "s/^post_max_size = .*/post_max_size = 200M/" "$php_ini"
-	sed -i "s/^memory_limit = .*/memory_limit = 256M/" "$php_ini"
+	# Size PHP per host memory instead of one fixed template: a 200M
+	# post_max_size / 256M memory_limit on a 512M VPS lets the default five
+	# workers exhaust RAM. PHP_RAM_MB exists so tests can pin the tier.
+	ram_mb=${PHP_RAM_MB:-$(awk '/MemTotal/ {printf "%d", $2 / 1024}' /proc/meminfo)}
+	if [ "$ram_mb" -lt 700 ]; then
+		pm_mode=ondemand; pm_max_children=2; pm_start=1; pm_min_spare=1; pm_max_spare=2
+		php_memory_limit=96M; php_post_max=32M
+	elif [ "$ram_mb" -lt 1400 ]; then
+		pm_mode=dynamic; pm_max_children=3; pm_start=1; pm_min_spare=1; pm_max_spare=2
+		php_memory_limit=128M; php_post_max=32M
+	elif [ "$ram_mb" -lt 3000 ]; then
+		pm_mode=dynamic; pm_max_children=5; pm_start=2; pm_min_spare=1; pm_max_spare=3
+		php_memory_limit=192M; php_post_max=32M
+	else
+		pm_mode=dynamic; pm_max_children=10; pm_start=3; pm_min_spare=2; pm_max_spare=5
+		php_memory_limit=256M; php_post_max=64M
+	fi
+
+	ini_set_key() {
+		_k="$1"; _v="$2"; _re=$(printf '%s' "$_k" | sed 's/\./\\./g')
+		if grep -qE "^;*${_re} = " "$php_ini"
+		then
+			sed -i -E "s|^;*${_re} = .*|${_k} = ${_v}|" "$php_ini"
+		else
+			printf '%s = %s\n' "$_k" "$_v" >> "$php_ini"
+		fi
+	}
+
+	ini_set_key upload_max_filesize "$php_post_max"
+	ini_set_key post_max_size "$php_post_max"
+	ini_set_key memory_limit "$php_memory_limit"
+	# Upload progress is only needed by apps that poll progress; disabling it
+	# removes a per-request session write and one attack surface.
+	ini_set_key session.upload_progress.enabled 0
 	if grep -q '^;*cgi.fix_pathinfo' "$php_ini"
 	then
 		sed -i "s/^;*cgi.fix_pathinfo=.*/cgi.fix_pathinfo=0/" "$php_ini"
@@ -694,19 +725,32 @@ function install_php {
 		printf '\ndate.timezone = Asia/Shanghai\n' >> "$php_ini"
 	fi
 
-	# Recycle every worker after 500 requests so long-running processes cannot
-	# accumulate memory leaks.
+	# Size the pool to the host and recycle workers every 500 requests so
+	# long-running processes cannot accumulate memory leaks.
 	if [ -f "$fpm_pool" ]
 	then
 		backup_file "$fpm_pool" pre-php-fpm-pool-backup
-		if grep -q '^;*pm\.max_requests' "$fpm_pool"
-		then
-			sed -i "s|^;*pm\.max_requests =.*|pm.max_requests = 500|" "$fpm_pool"
-		else
-			printf '\npm.max_requests = 500\n' >> "$fpm_pool"
+		pool_set() {
+			_k="$1"; _v="$2"; _re=$(printf '%s' "$_k" | sed 's/\./\\./g')
+			if grep -qE "^;*${_re} = " "$fpm_pool"
+			then
+				sed -i -E "s|^;*${_re} = .*|${_k} = ${_v}|" "$fpm_pool"
+			else
+				printf '%s = %s\n' "$_k" "$_v" >> "$fpm_pool"
+			fi
+		}
+		pool_set pm "$pm_mode"
+		pool_set pm.max_children "$pm_max_children"
+		pool_set pm.start_servers "$pm_start"
+		pool_set pm.min_spare_servers "$pm_min_spare"
+		pool_set pm.max_spare_servers "$pm_max_spare"
+		pool_set pm.max_requests 500
+		if [ "$pm_mode" = "ondemand" ]; then
+			pool_set pm.process_idle_timeout 10s
 		fi
+		print_info "PHP pool sizing (${ram_mb}MB RAM): ${pm_mode}, max_children=${pm_max_children}, memory_limit=${php_memory_limit}, post_max_size=${php_post_max}"
 	else
-		print_warn "PHP-FPM pool not found at $fpm_pool; skipping pm.max_requests"
+		print_warn "PHP-FPM pool not found at $fpm_pool; skipping pool tuning"
 	fi
 
 	systemctl enable "$fpm_service"
